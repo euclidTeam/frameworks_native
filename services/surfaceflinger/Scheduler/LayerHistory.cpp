@@ -112,14 +112,29 @@ void LayerHistory::registerLayer(Layer* layer, bool contentDetectionEnabled) {
     std::lock_guard lock(mLock);
     LOG_ALWAYS_FATAL_IF(findLayer(layer->getSequence()).first != LayerStatus::NotFound,
                         "%s already registered", layer->getName().c_str());
-    LayerVoteType type =
-            getVoteType(layer->getDefaultFrameRateCompatibility(), contentDetectionEnabled);
+    LayerVoteType type;
 
     using WindowType = gui::WindowInfo::Type;
     const auto windowType = layer->getWindowType();
 
-    if (windowType == WindowType::NOTIFICATION_SHADE) {
+    if (windowType == WindowType::STATUS_BAR ||
+        windowType == WindowType::SYSTEM_ALERT ||
+        windowType == WindowType::TOAST ||
+        windowType == WindowType::SYSTEM_DIALOG ||
+        windowType == WindowType::KEYGUARD_DIALOG ||
+        windowType == WindowType::INPUT_METHOD ||
+        windowType == WindowType::INPUT_METHOD_DIALOG ||
+        windowType == WindowType::NAVIGATION_BAR ||
+        windowType == WindowType::VOLUME_OVERLAY ||
+        windowType == WindowType::NAVIGATION_BAR_PANEL) {
+        type = LayerHistory::LayerVoteType::NoVote;
+    } else if (windowType == WindowType::WALLPAPER) {
+        type = LayerHistory::LayerVoteType::Min;
+    } else if (windowType == WindowType::NOTIFICATION_SHADE) {
         type = LayerHistory::LayerVoteType::Max;
+    } else {
+        type =
+            getVoteType(layer->getDefaultFrameRateCompatibility(), contentDetectionEnabled);
     }
 
     auto info = std::make_unique<LayerInfo>(layer->getName(), layer->getOwnerUid(), type);
