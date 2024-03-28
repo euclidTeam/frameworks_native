@@ -2279,7 +2279,7 @@ bool SurfaceFlinger::updateLayerSnapshotsLegacy(VsyncId vsyncId, nsecs_t frameTi
     outTransactionsAreEmpty = !needsTraversal;
     const bool shouldCommit = (getTransactionFlags() & ~eTransactionFlushNeeded) || needsTraversal;
     if (shouldCommit) {
-        commitTransactions();
+        commitTransactionsLegacy();
     }
 
     bool mustComposite = latchBuffers() || shouldCommit;
@@ -2403,8 +2403,14 @@ bool SurfaceFlinger::updateLayerSnapshots(VsyncId vsyncId, nsecs_t frameTimeNs,
         mLayerHierarchyBuilder.update(mLayerLifecycleManager);
     }
 
+    // Keep a copy of the drawing state (that is going to be overwritten
+    // by commitTransactionsLocked) outside of mStateLock so that the side
+    // effects of the State assignment don't happen with mStateLock held,
+    // which can cause deadlocks.
+    State drawingState(mDrawingState);
+    Mutex::Autolock lock(mStateLock);
     bool mustComposite = false;
-    mustComposite |= applyAndCommitDisplayTransactionStates(update.transactions);
+    mustComposite |= applyAndCommitDisplayTransactionStatesLocked(update.transactions);
 
     {
         ATRACE_NAME("LayerSnapshotBuilder:update");
@@ -2443,7 +2449,7 @@ bool SurfaceFlinger::updateLayerSnapshots(VsyncId vsyncId, nsecs_t frameTimeNs,
     bool newDataLatched = false;
     if (!mLegacyFrontEndEnabled) {
         ATRACE_NAME("DisplayCallbackAndStatsUpdates");
-        mustComposite |= applyTransactions(update.transactions, vsyncId);
+        mustComposite |= applyTransactionsLocked(update.transactions, vsyncId);
         traverseLegacyLayers([&](Layer* layer) { layer->commitTransaction(); });
         const nsecs_t latchTime = systemTime();
         bool unused = false;
@@ -3279,6 +3285,19 @@ void SurfaceFlinger::computeLayerBounds() {
 }
 
 void SurfaceFlinger::commitTransactions() {
+    ATRACE_CALL();
+    mDebugInTransaction = systemTime();
+
+    // Here we're guaranteed that some transaction flags are set
+    // so we can call commitTransactionsLocked unconditionally.
+    // We clear the flags with mStateLock held to guarantee that
+    // mCurrentState won't change until the transaction is committed.
+    mScheduler->modulateVsync({}, &VsyncModulator::onTransactionCommit);
+    commitTransactionsLocked(clearTransactionFlags(eTransactionMask));
+    mDebugInTransaction = 0;
+}
+
+void SurfaceFlinger::commitTransactionsLegacy() {
     ATRACE_CALL();
 
     // Keep a copy of the drawing state (that is going to be overwritten
@@ -5265,9 +5284,8 @@ bool SurfaceFlinger::applyTransactionState(const FrameTimelineInfo& frameTimelin
     return needsTraversal;
 }
 
-bool SurfaceFlinger::applyAndCommitDisplayTransactionStates(
+bool SurfaceFlinger::applyAndCommitDisplayTransactionStatesLocked(
         std::vector<TransactionState>& transactions) {
-    Mutex::Autolock lock(mStateLock);
     bool needsTraversal = false;
     uint32_t transactionFlags = 0;
     for (auto& transaction : transactions) {
@@ -6055,7 +6073,8 @@ void SurfaceFlinger::initializeDisplays() {
     if (mLegacyFrontEndEnabled) {
         applyTransactions(transactions, VsyncId{0});
     } else {
-        applyAndCommitDisplayTransactionStates(transactions);
+        Mutex::Autolock lock(mStateLock);
+        applyAndCommitDisplayTransactionStatesLocked(transactions);
     }
 
     {
