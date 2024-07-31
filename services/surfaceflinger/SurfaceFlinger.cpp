@@ -4831,24 +4831,9 @@ TransactionHandler::TransactionReadiness SurfaceFlinger::transactionReadyBufferC
 
         // If backpressure is enabled and we already have a buffer to commit, keep
         // the transaction in the queue.
-        // If the producer has been changed, we need to release and drop it here.
         const bool hasPendingBuffer =
                 flushState.bufferLayersReadyToPresent.contains(s.surface.get());
         if (layer->backpressureEnabled() && hasPendingBuffer && transaction.isAutoTimestamp) {
-            // The current producerId is already a newer producer than the incoming buffer.
-            // This means producer has been changed for this layer and the incoming buffer is
-            // older and we can release it here.
-            if (layer->getDrawingState().producerId > s.bufferData->producerId) {
-                layer->callReleaseBufferCallback(s.bufferData->releaseBufferListener,
-                                                 resolvedState.externalTexture->getBuffer(),
-                                                 s.bufferData->frameNumber,
-                                                 s.bufferData->acquireFence);
-                // Delete the entire state at this point and not just release the buffer because
-                // everything associated with the Layer in this Transaction is now out of date.
-                ATRACE_FORMAT("DeleteStaleBuffer %s producerId:%d > %d", layer->getDebugName(),
-                              layer->getDrawingState().producerId, s.bufferData->producerId);
-                return TraverseBuffersReturnValues::DELETE_AND_CONTINUE_TRAVERSAL;
-            }
             ATRACE_FORMAT("hasPendingBuffer %s", layer->getDebugName());
             ready = TransactionReadiness::NotReady;
             return TraverseBuffersReturnValues::STOP_TRAVERSAL;
