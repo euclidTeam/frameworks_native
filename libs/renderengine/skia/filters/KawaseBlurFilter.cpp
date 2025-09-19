@@ -33,24 +33,48 @@
 #include <include/gpu/GpuTypes.h>
 #include <include/gpu/ganesh/SkSurfaceGanesh.h>
 #include <log/log.h>
+#include <algorithm>
+#include <cmath>
 
 namespace android {
 namespace renderengine {
 namespace skia {
 
-KawaseBlurFilter::KawaseBlurFilter(): BlurFilter() {
+KawaseBlurFilter::KawaseBlurFilter() : BlurFilter() {
     SkString blurString(
-        "uniform shader child;"
-        "uniform float in_blurOffset;"
+            R"(
+uniform shader child;
+uniform float in_blurOffset;
 
-        "half4 main(float2 xy) {"
-            "half4 c = child.eval(xy);"
-            "c += child.eval(xy + float2(+in_blurOffset, +in_blurOffset));"
-            "c += child.eval(xy + float2(+in_blurOffset, -in_blurOffset));"
-            "c += child.eval(xy + float2(-in_blurOffset, -in_blurOffset));"
-            "c += child.eval(xy + float2(-in_blurOffset, +in_blurOffset));"
-            "return half4(c.rgb * 0.2, 1.0);"
-        "}");
+half3 rgb2hsv(half3 c) {
+    half4 K = half4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    half4 p = c.g < c.b ? half4(c.bg, K.wz) : half4(c.gb, K.xy);
+    half4 q = c.r < p.x ? half4(p.xyw, c.r) : half4(c.r, p.yzx);
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return half3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+half3 hsv2rgb(half3 c) {
+    half4 K = half4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    half3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+half4 main(float2 xy) {
+    half4 c = child.eval(xy);
+    c += child.eval(xy + float2(+in_blurOffset, +in_blurOffset));
+    c += child.eval(xy + float2(+in_blurOffset, -in_blurOffset));
+    c += child.eval(xy + float2(-in_blurOffset, -in_blurOffset));
+    c += child.eval(xy + float2(-in_blurOffset, +in_blurOffset));
+    c *= 0.2;
+
+    half3 hsv = rgb2hsv(c.rgb);
+    hsv.y *= 1.0;
+    c.rgb = hsv2rgb(hsv);
+
+    return c;
+})");
 
     auto [blurEffect, error] = SkRuntimeEffect::MakeForShader(blurString);
     if (!blurEffect) {
@@ -83,55 +107,91 @@ sk_sp<SkImage> KawaseBlurFilter::generate(SkiaGpuContext* context, const uint32_
         return input;
     }
 
-    // Kawase is an approximation of Gaussian, but it behaves differently from it.
-    // A radius transformation is required for approximating them, and also to introduce
-    // non-integer steps, necessary to smoothly interpolate large radii.
-    float tmpRadius = (float)blurRadius / 2.0f;
-    uint32_t numberOfPasses = std::min(kMaxPasses, (uint32_t)ceil(tmpRadius));
-    float radiusByPasses = tmpRadius / (float)numberOfPasses;
-
-    // create blur surface with the bit depth and colorspace of the original surface
-    SkImageInfo scaledInfo = input->imageInfo().makeWH(std::ceil(blurRect.width() * kInputScale),
-                                                       std::ceil(blurRect.height() * kInputScale));
-
-    // For sampling Skia's API expects the inverse of what logically seems appropriate. In this
-    // case you might expect Translate(blurRect.fLeft, blurRect.fTop) X Scale(kInverseInputScale)
-    // but instead we must do the inverse.
-    SkMatrix blurMatrix = SkMatrix::Translate(-blurRect.fLeft, -blurRect.fTop);
-    blurMatrix.postScale(kInputScale, kInputScale);
-
-    // start by downscaling and doing the first blur pass
-    SkSamplingOptions linear(SkFilterMode::kLinear, SkMipmapMode::kNone);
     SkRuntimeShaderBuilder blurBuilder(mBlurEffect);
-    blurBuilder.child("child") =
-            input->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, linear, blurMatrix);
-    blurBuilder.uniform("in_blurOffset") = radiusByPasses * kInputScale;
+    SkSamplingOptions linear(SkFilterMode::kLinear, SkMipmapMode::kNone);
+    float tmpRadius = (float)blurRadius;
 
-    sk_sp<SkSurface> surface = context->createRenderTarget(scaledInfo);
-    LOG_ALWAYS_FATAL_IF(!surface, "%s: Failed to create surface for blurring!", __func__);
-    sk_sp<SkImage> tmpBlur = makeImage(surface.get(), &blurBuilder);
+    constexpr float kFastPathThreshold = 12.0f;
 
-    // And now we'll build our chain of scaled blur stages. If there is more than one pass,
-    // create a second surface and ping pong between them.
-    sk_sp<SkSurface> surfaceTwo;
-    if (numberOfPasses <= 1) {
-        LOG_ALWAYS_FATAL_IF(tmpBlur == nullptr, "%s: tmpBlur is null", __func__);
-    } else {
-        surfaceTwo = surface->makeSurface(scaledInfo);
-        LOG_ALWAYS_FATAL_IF(!surfaceTwo, "%s: Failed to create second blur surface!", __func__);
+    if (tmpRadius <= kFastPathThreshold) {
+        constexpr float kFastPathScale = 0.25f;
+        SkImageInfo info =
+                input->imageInfo().makeWH(std::ceil(blurRect.width() * kFastPathScale),
+                                          std::ceil(blurRect.height() * kFastPathScale));
+        SkMatrix matrix = SkMatrix::Translate(-blurRect.fLeft, -blurRect.fTop);
+        matrix.postScale(kFastPathScale, kFastPathScale);
 
-        for (auto i = 1; i < numberOfPasses; i++) {
-            LOG_ALWAYS_FATAL_IF(tmpBlur == nullptr, "%s: tmpBlur is null for pass %d", __func__, i);
+        blurBuilder.child("child") =
+                input->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, linear, matrix);
+
+        uint32_t numberOfPasses = std::clamp((uint32_t)std::ceil(tmpRadius / 3.0f), 1u, 4u);
+        float radiusByPasses = (numberOfPasses > 0) ? (tmpRadius / (float)numberOfPasses) : 0.0f;
+
+        sk_sp<SkSurface> surface = context->createRenderTarget(info);
+        sk_sp<SkSurface> surfaceTwo = context->createRenderTarget(info);
+        sk_sp<SkImage> tmpBlur = nullptr;
+
+        for (auto i = 0; i < numberOfPasses; i++) {
+            blurBuilder.uniform("in_blurOffset") = (float)(i + 1) * radiusByPasses * kFastPathScale;
+            tmpBlur = makeImage(surface.get(), &blurBuilder);
             blurBuilder.child("child") =
                     tmpBlur->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, linear);
-            blurBuilder.uniform("in_blurOffset") = (float) i * radiusByPasses * kInputScale;
-            tmpBlur = makeImage(surfaceTwo.get(), &blurBuilder);
             using std::swap;
             swap(surface, surfaceTwo);
         }
-    }
+        return tmpBlur;
 
-    return tmpBlur;
+    } else {
+        constexpr float kHiResScale = 0.5f;
+        SkImageInfo hiResInfo =
+                input->imageInfo().makeWH(std::ceil(blurRect.width() * kHiResScale),
+                                          std::ceil(blurRect.height() * kHiResScale));
+        SkMatrix hiResMatrix = SkMatrix::Translate(-blurRect.fLeft, -blurRect.fTop);
+        hiResMatrix.postScale(kHiResScale, kHiResScale);
+
+        blurBuilder.child("child") =
+                input->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, linear, hiResMatrix);
+        blurBuilder.uniform("in_blurOffset") = 1.0f * kHiResScale;
+
+        sk_sp<SkSurface> hiResSurface = context->createRenderTarget(hiResInfo);
+        LOG_ALWAYS_FATAL_IF(!hiResSurface, "%s: Failed to create hi-res surface!", __func__);
+        sk_sp<SkImage> hiResBlur = makeImage(hiResSurface.get(), &blurBuilder);
+
+        constexpr float kLoResScale = 0.25f;
+        SkImageInfo loResInfo =
+                input->imageInfo().makeWH(std::ceil(blurRect.width() * kLoResScale),
+                                          std::ceil(blurRect.height() * kLoResScale));
+        sk_sp<SkSurface> loResSurface = context->createRenderTarget(loResInfo);
+        LOG_ALWAYS_FATAL_IF(!loResSurface, "%s: Failed to create lo-res surface!", __func__);
+
+        SkPaint downsamplePaint;
+        loResSurface->getCanvas()->drawImageRect(
+                hiResBlur, SkRect::Make(loResInfo.dimensions()),
+                SkSamplingOptions({1.0f / 3.0f, 1.0f / 3.0f}), &downsamplePaint);
+        sk_sp<SkImage> tmpBlur = loResSurface->makeImageSnapshot();
+
+        uint32_t numberOfPasses = std::clamp((uint32_t)std::ceil(tmpRadius / 3.0f), 2u, 8u);
+        float radiusByPasses = (numberOfPasses > 0) ? (tmpRadius / (float)numberOfPasses) : 0.0f;
+
+        if (numberOfPasses > 1) {
+            sk_sp<SkSurface> surfaceTwo = context->createRenderTarget(loResInfo);
+            LOG_ALWAYS_FATAL_IF(!surfaceTwo, "%s: Failed to create second blur surface!",
+                                __func__);
+
+            for (auto i = 0; i < numberOfPasses; i++) {
+                LOG_ALWAYS_FATAL_IF(tmpBlur == nullptr, "%s: tmpBlur is null for pass %d",
+                                    __func__, i);
+                blurBuilder.child("child") =
+                        tmpBlur->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, linear);
+                blurBuilder.uniform("in_blurOffset") =
+                        (float)(i + 1) * radiusByPasses * kLoResScale;
+                tmpBlur = makeImage(loResSurface.get(), &blurBuilder);
+                using std::swap;
+                swap(loResSurface, surfaceTwo);
+            }
+        }
+        return tmpBlur;
+    }
 }
 
 } // namespace skia
