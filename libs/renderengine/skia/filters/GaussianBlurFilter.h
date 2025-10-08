@@ -38,7 +38,7 @@ public:
 
     // Execute blur, saving it to a texture
     sk_sp<SkImage> generate(SkiaGpuContext* context, const uint32_t radius,
-                            const sk_sp<SkImage> blurInput, const SkRect& blurRect) const override;
+                            const sk_sp<SkImage> blurInput, const SkRect& blurRect) override;
 };
 
 } // namespace skia

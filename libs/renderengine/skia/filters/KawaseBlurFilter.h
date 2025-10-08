@@ -39,15 +39,23 @@ public:
     static constexpr uint32_t kMaxPasses = 4;
 
     explicit KawaseBlurFilter();
-    virtual ~KawaseBlurFilter(){}
+    virtual ~KawaseBlurFilter() {}
 
     // Execute blur, saving it to a texture
     sk_sp<SkImage> generate(SkiaGpuContext* context, const uint32_t radius,
-                            const sk_sp<SkImage> blurInput, const SkRect& blurRect) const override;
+                            const sk_sp<SkImage> blurInput, const SkRect& blurRect) override;
 
 private:
     sk_sp<SkRuntimeEffect> mBlurEffect;
-};
+
+    sk_sp<SkImage> mCachedBlurredImage;
+    uint32_t mCachedInputUniqueID = 0;
+    uint32_t mCachedBlurRadius = 0;
+    SkRect mCachedBlurRect = SkRect::MakeEmpty();
+
+    sk_sp<SkSurface> mSurface1;
+    sk_sp<SkSurface> mSurface2;
+ };
 
 } // namespace skia
 } // namespace renderengine

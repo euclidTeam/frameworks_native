@@ -137,7 +137,7 @@ void KawaseBlurDualFilter::blurInto(const sk_sp<SkSurface>& drawSurface, sk_sp<S
 
 sk_sp<SkImage> KawaseBlurDualFilter::generate(SkiaGpuContext* context, const uint32_t blurRadius,
                                               const sk_sp<SkImage> input,
-                                              const SkRect& blurRect) const {
+                                              const SkRect& blurRect) {
     // Apply a conversion factor of (1 / sqrt(3)) to match Skia's built-in blur as used by
     // RenderEffect. See the comment in SkBlurMask.cpp for reasoning behind this.
     const float radius = blurRadius * 0.57735f;

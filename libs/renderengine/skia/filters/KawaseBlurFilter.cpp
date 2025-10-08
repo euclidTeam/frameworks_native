@@ -46,21 +46,6 @@ KawaseBlurFilter::KawaseBlurFilter() : BlurFilter() {
 uniform shader child;
 uniform float in_blurOffset;
 
-half3 rgb2hsv(half3 c) {
-    half4 K = half4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
-    half4 p = c.g < c.b ? half4(c.bg, K.wz) : half4(c.gb, K.xy);
-    half4 q = c.r < p.x ? half4(p.xyw, c.r) : half4(c.r, p.yzx);
-    float d = q.x - min(q.w, q.y);
-    float e = 1.0e-10;
-    return half3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
-}
-
-half3 hsv2rgb(half3 c) {
-    half4 K = half4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
-    half3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
-}
-
 half4 main(float2 xy) {
     half4 c = child.eval(xy);
     c += child.eval(xy + float2(+in_blurOffset, +in_blurOffset));
@@ -68,10 +53,6 @@ half4 main(float2 xy) {
     c += child.eval(xy + float2(-in_blurOffset, -in_blurOffset));
     c += child.eval(xy + float2(-in_blurOffset, +in_blurOffset));
     c *= 0.2;
-
-    half3 hsv = rgb2hsv(c.rgb);
-    hsv.y *= 1.0;
-    c.rgb = hsv2rgb(hsv);
 
     return c;
 })");
@@ -99,9 +80,14 @@ static sk_sp<SkImage> makeImage(SkSurface* surface, SkRuntimeShaderBuilder* buil
 
 sk_sp<SkImage> KawaseBlurFilter::generate(SkiaGpuContext* context, const uint32_t blurRadius,
                                           const sk_sp<SkImage> input,
-                                          const SkRect& blurRect) const {
+                                          const SkRect& blurRect) {
     LOG_ALWAYS_FATAL_IF(context == nullptr, "%s: Needs GPU context", __func__);
     LOG_ALWAYS_FATAL_IF(input == nullptr, "%s: Invalid input image", __func__);
+
+    if (mCachedBlurredImage && mCachedInputUniqueID == input->uniqueID() &&
+       mCachedBlurRadius == blurRadius && mCachedBlurRect == blurRect) {
+        return mCachedBlurredImage;
+    }
 
     if (blurRadius == 0) {
         return input;
@@ -124,11 +110,19 @@ sk_sp<SkImage> KawaseBlurFilter::generate(SkiaGpuContext* context, const uint32_
         blurBuilder.child("child") =
                 input->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, linear, matrix);
 
-        uint32_t numberOfPasses = std::clamp((uint32_t)std::ceil(tmpRadius / 3.0f), 1u, 4u);
+        uint32_t passCount = (uint32_t)std::ceil(tmpRadius / 3.0f);
+        uint32_t numberOfPasses = std::clamp(passCount, 1u, 4u);
         float radiusByPasses = (numberOfPasses > 0) ? (tmpRadius / (float)numberOfPasses) : 0.0f;
 
-        sk_sp<SkSurface> surface = context->createRenderTarget(info);
-        sk_sp<SkSurface> surfaceTwo = context->createRenderTarget(info);
+        if (!mSurface1 || !mSurface2 || mSurface1->width() < info.width() || mSurface1->height() < info.height()) {
+            mSurface1 = context->createRenderTarget(info);
+            mSurface2 = context->createRenderTarget(info);
+        }
+        sk_sp<SkSurface> surface = mSurface1->makeSurface(info);
+        sk_sp<SkSurface> surfaceTwo = mSurface2->makeSurface(info);
+        LOG_ALWAYS_FATAL_IF(!surface || !surfaceTwo, "%s: Failed to create blur surfaces!",
+                            __func__);
+
         sk_sp<SkImage> tmpBlur = nullptr;
 
         for (auto i = 0; i < numberOfPasses; i++) {
@@ -139,7 +133,12 @@ sk_sp<SkImage> KawaseBlurFilter::generate(SkiaGpuContext* context, const uint32_
             using std::swap;
             swap(surface, surfaceTwo);
         }
-        return tmpBlur;
+        mCachedInputUniqueID = input->uniqueID();
+        mCachedBlurRadius = blurRadius;
+        mCachedBlurRect = blurRect;
+        mCachedBlurredImage = tmpBlur;
+
+        return mCachedBlurredImage;
 
     } else {
         constexpr float kDownsampleScale = 0.25f;
@@ -149,13 +148,18 @@ sk_sp<SkImage> KawaseBlurFilter::generate(SkiaGpuContext* context, const uint32_
         SkMatrix matrix = SkMatrix::Translate(-blurRect.fLeft, -blurRect.fTop);
         matrix.postScale(kDownsampleScale, kDownsampleScale);
 
-        sk_sp<SkSurface> surface = context->createRenderTarget(info);
-        sk_sp<SkSurface> surfaceTwo = context->createRenderTarget(info);
+        if (!mSurface1 || !mSurface2 || mSurface1->width() < info.width() || mSurface1->height() < info.height()) {
+            mSurface1 = context->createRenderTarget(info);
+            mSurface2 = context->createRenderTarget(info);
+        }
+        sk_sp<SkSurface> surface = mSurface1->makeSurface(info);
+        sk_sp<SkSurface> surfaceTwo = mSurface2->makeSurface(info);
         LOG_ALWAYS_FATAL_IF(!surface || !surfaceTwo, "%s: Failed to create blur surfaces!",
                             __func__);
         sk_sp<SkImage> tmpBlur = nullptr;
 
-        uint32_t numberOfPasses = std::clamp((uint32_t)std::ceil(tmpRadius / 3.0f), 2u, 8u);
+        uint32_t passCount = (uint32_t)std::ceil(tmpRadius / 3.0f);
+        uint32_t numberOfPasses = std::clamp(passCount, 2u, 8u);
         float radiusByPasses = (numberOfPasses > 0) ? (tmpRadius / (float)numberOfPasses) : 0.0f;
 
         blurBuilder.child("child") =
@@ -173,7 +177,12 @@ sk_sp<SkImage> KawaseBlurFilter::generate(SkiaGpuContext* context, const uint32_
             using std::swap;
             swap(surface, surfaceTwo);
         }
-        return tmpBlur;
+        mCachedInputUniqueID = input->uniqueID();
+        mCachedBlurRadius = blurRadius;
+        mCachedBlurRect = blurRect;
+        mCachedBlurredImage = tmpBlur;
+
+        return mCachedBlurredImage;
     }
 }
 
