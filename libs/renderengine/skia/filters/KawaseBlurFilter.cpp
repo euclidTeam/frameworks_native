@@ -142,53 +142,36 @@ sk_sp<SkImage> KawaseBlurFilter::generate(SkiaGpuContext* context, const uint32_
         return tmpBlur;
 
     } else {
-        constexpr float kHiResScale = 0.5f;
-        SkImageInfo hiResInfo =
-                input->imageInfo().makeWH(std::ceil(blurRect.width() * kHiResScale),
-                                          std::ceil(blurRect.height() * kHiResScale));
-        SkMatrix hiResMatrix = SkMatrix::Translate(-blurRect.fLeft, -blurRect.fTop);
-        hiResMatrix.postScale(kHiResScale, kHiResScale);
+        constexpr float kDownsampleScale = 0.25f;
+        SkImageInfo info =
+                input->imageInfo().makeWH(std::ceil(blurRect.width() * kDownsampleScale),
+                                          std::ceil(blurRect.height() * kDownsampleScale));
+        SkMatrix matrix = SkMatrix::Translate(-blurRect.fLeft, -blurRect.fTop);
+        matrix.postScale(kDownsampleScale, kDownsampleScale);
 
-        blurBuilder.child("child") =
-                input->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, linear, hiResMatrix);
-        blurBuilder.uniform("in_blurOffset") = 1.0f * kHiResScale;
-
-        sk_sp<SkSurface> hiResSurface = context->createRenderTarget(hiResInfo);
-        LOG_ALWAYS_FATAL_IF(!hiResSurface, "%s: Failed to create hi-res surface!", __func__);
-        sk_sp<SkImage> hiResBlur = makeImage(hiResSurface.get(), &blurBuilder);
-
-        constexpr float kLoResScale = 0.25f;
-        SkImageInfo loResInfo =
-                input->imageInfo().makeWH(std::ceil(blurRect.width() * kLoResScale),
-                                          std::ceil(blurRect.height() * kLoResScale));
-        sk_sp<SkSurface> loResSurface = context->createRenderTarget(loResInfo);
-        LOG_ALWAYS_FATAL_IF(!loResSurface, "%s: Failed to create lo-res surface!", __func__);
-
-        SkPaint downsamplePaint;
-        loResSurface->getCanvas()->drawImageRect(
-                hiResBlur, SkRect::Make(loResInfo.dimensions()),
-                SkSamplingOptions({1.0f / 3.0f, 1.0f / 3.0f}), &downsamplePaint);
-        sk_sp<SkImage> tmpBlur = loResSurface->makeImageSnapshot();
+        sk_sp<SkSurface> surface = context->createRenderTarget(info);
+        sk_sp<SkSurface> surfaceTwo = context->createRenderTarget(info);
+        LOG_ALWAYS_FATAL_IF(!surface || !surfaceTwo, "%s: Failed to create blur surfaces!",
+                            __func__);
+        sk_sp<SkImage> tmpBlur = nullptr;
 
         uint32_t numberOfPasses = std::clamp((uint32_t)std::ceil(tmpRadius / 3.0f), 2u, 8u);
         float radiusByPasses = (numberOfPasses > 0) ? (tmpRadius / (float)numberOfPasses) : 0.0f;
 
-        if (numberOfPasses > 1) {
-            sk_sp<SkSurface> surfaceTwo = context->createRenderTarget(loResInfo);
-            LOG_ALWAYS_FATAL_IF(!surfaceTwo, "%s: Failed to create second blur surface!",
-                                __func__);
+        blurBuilder.child("child") =
+                input->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, linear, matrix);
+        blurBuilder.uniform("in_blurOffset") = (float)(1) * radiusByPasses * kDownsampleScale;
+        tmpBlur = makeImage(surface.get(), &blurBuilder);
+        swap(surface, surfaceTwo);
 
-            for (auto i = 0; i < numberOfPasses; i++) {
-                LOG_ALWAYS_FATAL_IF(tmpBlur == nullptr, "%s: tmpBlur is null for pass %d",
-                                    __func__, i);
-                blurBuilder.child("child") =
-                        tmpBlur->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, linear);
-                blurBuilder.uniform("in_blurOffset") =
-                        (float)(i + 1) * radiusByPasses * kLoResScale;
-                tmpBlur = makeImage(loResSurface.get(), &blurBuilder);
-                using std::swap;
-                swap(loResSurface, surfaceTwo);
-            }
+        for (uint32_t i = 1; i < numberOfPasses; i++) {
+            blurBuilder.child("child") =
+                    tmpBlur->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, linear);
+            blurBuilder.uniform("in_blurOffset") =
+                    (float)(i + 1) * radiusByPasses * kDownsampleScale;
+            tmpBlur = makeImage(surface.get(), &blurBuilder);
+            using std::swap;
+            swap(surface, surfaceTwo);
         }
         return tmpBlur;
     }
